@@ -1,0 +1,240 @@
+x-service-base: &service-base
+  restart: unless-stopped
+  env_file: .env
+  networks: [school-net]
+
+x-db-base: &db-base
+  image: mysql:8.0
+  restart: unless-stopped
+  command: >
+    --default-authentication-plugin=mysql_native_password
+    --max_connections=300
+  networks: [school-net]
+  healthcheck:
+    test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p$$MYSQL_ROOT_PASSWORD"]
+    interval: 10s
+    timeout: 5s
+    retries: 10
+    start_period: 30s
+
+services:
+  # database
+  auth-db:
+    <<: *db-base
+    # container_name: auth-db
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${AUTH_DB_NAME}
+      MYSQL_USER: ${AUTH_DB_USER}
+      MYSQL_PASSWORD: ${AUTH_DB_PASSWORD}
+    volumes:
+      - auth-db-data:/var/lib/mysql
+    ports: ["5306:3306"]
+
+  academic-db:
+    <<: *db-base
+    # container_name: acadenic-db
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${ACADEMIC_DB_NAME}
+      MYSQL_USER: ${ACADEMIC_DB_USER}
+      MYSQL_PASSWORD: ${ACADEMIC_DB_PASSWORD}
+    volumes:
+      - academic-db-data:/var/lib/mysql
+    ports: ["5307:3306"]
+
+  record-db:
+    <<: *db-base
+    container_name: record-db
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${RECORD_DB_NAME}
+      MYSQL_USER: ${RECORD_DB_USER}
+      MYSQL_PASSWORD: ${RECORD_DB_PASSWORD}
+    volumes:
+      - record-db-data:/var/lib/mysql
+    ports: ["5308:3306"]
+
+  payment-db:
+      <<: *db-base
+      environment:
+        MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+        MYSQL_DATABASE: ${PAYMENT_DB_NAME}
+        MYSQL_USER: ${PAYMENT_DB_USER}
+        MYSQL_PASSWORD: ${PAYMENT_DB_PASSWORD}
+      volumes:
+        - payment-db-data:/var/lib/mysql 
+      ports: ["5309:3306"]
+  # redis cache + bullQM
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server /usr/local/etc/redis/redis.conf
+    volumes:
+      - ./infra/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis-data:/data
+    ports: ["6379:6379"]
+    networks: [school-net]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # application service
+  auth-service:
+    <<: *service-base
+    # container_name: auth-service
+    build:
+      context: .
+      dockerfile: services/auth-service/Dockerfile
+    environment:
+      SERVICE_NAME: auth-service
+      PORT: ${AUTH_SERVICE_PORT}
+      DB_HOST: auth-db
+      DB_NAME: ${AUTH_DB_NAME}
+      DB_PORT: 3306
+      DB_USER: ${AUTH_DB_USER}
+      DB_PASSWORD: ${AUTH_DB_PASSWORD}
+      REDIS_HOST: redis
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN}
+      # Cross-service binding to academic-service (profile creation on register)
+      ACADEMIC_SERVICE_URL: http://academic-service:${ACADEMIC_SERVICE_PORT}
+      # Cross-service binding to notification-service (welcome notification)
+      NOTIFICATION_SERVICE_URL: http://notification-service:${NOTIFICATION_SERVICE_PORT}
+    depends_on:
+      auth-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  academic-service:
+      <<: *service-base
+      # container_name: academic-service
+      build:
+        context: .
+        dockerfile: services/academic-service/Dockerfile
+      environment:
+        SERVICE_NAME: academic-service
+        PORT: ${ACADEMIC_SERVICE_PORT}
+        DB_HOST: academic-db
+        DB_NAME: ${ACADEMIC_DB_NAME}
+        DB_PORT: 3306
+        DB_USER: ${ACADEMIC_DB_USER}
+        DB_PASSWORD: ${ACADEMIC_DB_PASSWORD}
+        REDIS_HOST: redis
+        # Cross-service binding to auth-service (userId resolution + user join)
+        AUTH_SERVICE_URL: http://auth-service:${AUTH_SERVICE_PORT}
+        # Cross-service binding to payment-service (student -> payments join)
+        PAYMENT_SERVICE_URL: http://payment-service:${PAYMENT_SERVICE_PORT}
+        # Cross-service binding to notification-service (enrollment notification)
+        NOTIFICATION_SERVICE_URL: http://notification-service:${NOTIFICATION_SERVICE_PORT}
+        INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN}
+      depends_on:
+        academic-db:
+          condition: service_healthy
+        redis:
+          condition: service_healthy
+        auth-service:
+          condition: service_started
+
+  record-service:
+      <<: *service-base
+      build:
+        context: .
+        dockerfile: services/record-service/Dockerfile
+      environment:
+        SERVICE_NAME: record-service
+        PORT: ${RECORD_SERVICE_PORT}
+        DB_HOST: record-db
+        DB_NAME: ${RECORD_DB_NAME}
+        DB_PORT: 3306
+        DB_USER: ${RECORD_DB_USER}
+        DB_PASSWORD: ${RECORD_DB_PASSWORD}
+        REDIS_HOST: redis
+        # Cross-service binding to academic-service (ref verification + joins)
+        ACADEMIC_SERVICE_URL: http://academic-service:${ACADEMIC_SERVICE_PORT}
+        # Cross-service binding to notification-service (absence notifications)
+        NOTIFICATION_SERVICE_URL: http://notification-service:${NOTIFICATION_SERVICE_PORT}
+        INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN}
+      depends_on:
+        record-db:
+          condition: service_healthy
+        redis:
+          condition: service_healthy
+        academic-service:
+          condition: service_started
+
+  payment-service:
+    <<: *service-base
+    build:  
+      context: .
+      dockerfile: services/payment-service/Dockerfile
+    environment:
+      SERVICE_NAME: payment-service
+      PORT: ${PAYMENT_SERVICE_PORT}
+      BAKONG_ACCESS_TOKEN: ${BAKONG_ACCESS_TOKEN}
+      DB_HOST: payment-db
+      DB_PORT: 3306
+      DB_NAME: ${PAYMENT_DB_NAME}
+      DB_USER: ${PAYMENT_DB_USER}
+      DB_PASSWORD: ${PAYMENT_DB_PASSWORD}
+      REDIS_HOST: redis
+      # Cross-service binding to academic-service (studentId verification + student join)
+      ACADEMIC_SERVICE_URL: http://academic-service:${ACADEMIC_SERVICE_PORT}
+      # Cross-service binding to notification-service (payment receipt notification)
+      NOTIFICATION_SERVICE_URL: http://notification-service:${NOTIFICATION_SERVICE_PORT}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN}
+    depends_on:
+      payment-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      academic-service:
+        condition: service_started
+        
+  notification-service:
+    <<: *service-base
+    build:  
+      context: .
+      dockerfile: services/notification-service/Dockerfile
+    environment:
+      SERVICE_NAME: notification-service
+      PORT: ${NOTIFICATION_SERVICE_PORT}
+      REDIS_HOST: redis
+      # Cross-service bindings to auth/academic-service (recipient resolution:
+      # userId -> auth_db email, studentId -> academic_db email)
+      AUTH_SERVICE_URL: http://auth-service:${AUTH_SERVICE_PORT}
+      ACADEMIC_SERVICE_URL: http://academic-service:${ACADEMIC_SERVICE_PORT}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # nginx gateway
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: school-gateway
+    restart: unless-stopped
+    ports:
+      # host port on this machine Apache 
+      - "8080:80"
+    networks: [school-net]
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - auth-service
+      - academic-service
+      - record-service
+      - payment-service
+      - notification-service
+networks:
+  school-net:
+    driver: bridge
+
+volumes:
+  auth-db-data:
+  academic-db-data:
+  record-db-data:
+  payment-db-data:
+  redis-data:
